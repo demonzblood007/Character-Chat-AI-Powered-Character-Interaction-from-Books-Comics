@@ -1,0 +1,76 @@
+{
+  "description": "Expected extraction results from sample_comic.txt",
+  "expected_characters": [
+    {
+      "name": "Batman",
+      "aliases": ["Bruce Wayne"],
+      "powers_keywords": ["martial arts", "detective", "technology"],
+      "min_count": 1
+    },
+    {
+      "name": "Joker",
+      "aliases": [],
+      "powers_keywords": ["chaos", "unpredictable"],
+      "min_count": 1
+    },
+    {
+      "name": "Robin",
+      "aliases": ["Dick Grayson"],
+      "powers_keywords": ["combat", "agility"],
+      "min_count": 1
+    },
+    {
+      "name": "Alfred Pennyworth",
+      "aliases": ["Alfred"],
+      "powers_keywords": ["butler", "medical"],
+      "min_count": 1
+    },
+    {
+      "name": "Commissioner Gordon",
+      "aliases": ["James Gordon", "Jim Gordon"],
+      "powers_keywords": [],
+      "min_count": 1
+    },
+    {
+      "name": "Harley Quinn",
+      "aliases": [],
+      "powers_keywords": [],
+      "min_count": 1
+    }
+  ],
+  "expected_relationships": [
+    {
+      "source": "Batman",
+      "target": "Joker",
+      "type": "enemy",
+      "bidirectional": true
+    },
+    {
+      "source": "Batman",
+      "target": "Robin",
+      "type": "mentor",
+      "bidirectional": false
+    },
+    {
+      "source": "Batman",
+      "target": "Alfred Pennyworth",
+      "type": "family",
+      "bidirectional": true
+    },
+    {
+      "source": "Batman",
+      "target": "Commissioner Gordon",
+      "type": "ally",
+      "bidirectional": true
+    },
+    {
+      "source": "Joker",
+      "target": "Harley Quinn",
+      "type": "ally",
+      "bidirectional": true
+    }
+  ],
+  "min_character_count": 5,
+  "min_relationship_count": 4
+}
+
