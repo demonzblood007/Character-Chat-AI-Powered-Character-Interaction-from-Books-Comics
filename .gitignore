@@ -25,6 +25,18 @@ data/
 logs/
 *.log
 
+# Build artifacts
+app/.next/
+frontend/.next/
+frontend/out/
+frontend/build/
+dist/
+build/
+
+# Node modules
+node_modules/
+frontend/node_modules/
+
 # IDE settings
 .vscode/
 .idea/
@@ -33,3 +45,6 @@ Thumbs.db
 
 # Misc
 *.tmp
+*.swp
+*.swo
+*~

@@ -1,20 +1,37 @@
-from fastapi import FastAPI, UploadFile, HTTPException, Query, Header
+from fastapi import FastAPI, UploadFile, HTTPException, Query, Header, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 import os
 import json
+import asyncio
+import shutil
 from pathlib import Path
 from bson import ObjectId
 from neo4j import GraphDatabase
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from app.db.collections.files import FileSchema
 from app.utils.file import save_to_disk
 from app.db.collections.files import files_collection
-from app.workers_queue.workers import chat_with_character, ChatRequest
-from app.workers_queue.workers import enqueue_file_processing
 
-app = FastAPI(title="Comic Character Chat API", version="1.0.0")
+# Authentication imports
+from app.auth import auth_router, get_current_user, get_current_user_optional
+from app.users.models import User
+from app.db.db import database
+
+# New chat service imports
+from app.chat.manager import get_chat_manager, get_chat_service
+from app.chat.service import ChatService
+
+app = FastAPI(
+    title="Character Chat API",
+    version="2.0.0",
+    description="AI-powered character interaction from books and comics",
+)
 
 # Add CORS middleware
 app.add_middleware(
@@ -25,6 +42,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include authentication router
+app.include_router(auth_router)
+
+# Include v2 chat router (with memory integration)
+from app.chat.router import router as chat_v2_router
+app.include_router(chat_v2_router)
+
+# Include character library router
+from app.characters.router import router as character_router
+app.include_router(character_router)
+
 # Database & storage configuration
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB = os.getenv("MONGODB_DB", "character_chat")
@@ -33,6 +61,29 @@ NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 UPLOAD_ROOT = Path(os.getenv("UPLOAD_ROOT", "uploads")).resolve()
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+async def _rm_tree(path: Path) -> None:
+    """Remove a directory tree without blocking the event loop."""
+    if not path.exists():
+        return
+    await asyncio.to_thread(shutil.rmtree, path, True)
+
+# Neo4j connection pool (shared driver instance)
+_neo4j_driver = None
+
+def get_neo4j_driver():
+    """Get or create a shared Neo4j driver instance with connection pooling."""
+    global _neo4j_driver
+    if _neo4j_driver is None:
+        _neo4j_driver = GraphDatabase.driver(
+            NEO4J_URI, 
+            auth=(NEO4J_USER, NEO4J_PASSWORD),
+            max_connection_lifetime=3600,
+            max_connection_pool_size=50,
+            connection_acquisition_timeout=60
+        )
+    return _neo4j_driver
 
 
 @app.get("/")
@@ -84,7 +135,7 @@ async def health_check():
     # Check Qdrant
     try:
         from qdrant_client import QdrantClient
-        qdrant_host = os.getenv("QDRANT_HOST", "qdrant")
+        qdrant_host = os.getenv("QDRANT_HOST", "localhost")
         qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
         client = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=5)
         client.get_collections()
@@ -95,7 +146,7 @@ async def health_check():
     
     # Check Redis
     try:
-        redis_host = os.getenv("REDIS_HOST", "redis")
+        redis_host = os.getenv("REDIS_HOST", "localhost")
         redis_port = int(os.getenv("REDIS_PORT", 6379))
         redis_conn = Redis(host=redis_host, port=redis_port, socket_timeout=5)
         redis_conn.ping()
@@ -112,8 +163,41 @@ async def health_check():
     return health_status
 
 
+async def get_user_id(
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    x_user_id: Optional[str] = Header(None, alias="X-User-ID"),
+) -> str:
+    """
+    Get user ID from JWT token or X-User-ID header.
+    Supports both new JWT auth and legacy header auth for backward compatibility.
+    """
+    if current_user:
+        return current_user.id
+    if x_user_id:
+        return x_user_id
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required. Provide JWT token or X-User-ID header."
+    )
+
+class LegacyChatRequest(BaseModel):
+    """
+    Legacy chat request model (deprecated).
+
+    - `user_id` is accepted for backwards compatibility but ignored; auth context wins.
+    - v2 chat uses the `X-User-ID` header or JWT token instead.
+    """
+    character_name: str
+    message: str
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+
 @app.post("/upload")
-async def upload_file(file: UploadFile, user_id: str = Header(..., alias="X-User-ID")):
+async def upload_file(
+    file: UploadFile,
+    user_id: str = Depends(get_user_id),
+):
     """Upload a PDF file for processing with comprehensive validation"""
     import os
     
@@ -170,9 +254,20 @@ async def upload_file(file: UploadFile, user_id: str = Header(..., alias="X-User
         )
 
         # Enqueue for processing with user_id context
+        from app.workers_queue.workers import enqueue_file_processing
         enqueue_file_processing(file_path, db_file.inserted_id, user_id)
 
-        return {"file_id": str(db_file.inserted_id), "status": "queued"}
+        # Return response matching BookFile schema
+        from datetime import datetime
+        upload_date = datetime.utcnow().isoformat()
+        return {
+            "id": str(db_file.inserted_id),
+            "filename": file.filename,
+            "upload_date": upload_date,
+            "status": "queued",
+            "character_count": None,
+            "relationship_count": None,
+        }
 
     except Exception as e:
         print(f"Error uploading file: {e}")
@@ -180,43 +275,61 @@ async def upload_file(file: UploadFile, user_id: str = Header(..., alias="X-User
 
 
 @app.get("/files")
-async def get_files(user_id: str = Header(..., alias="X-User-ID")):
+async def get_files(user_id: str = Depends(get_user_id)):
     """Get all uploaded files with their status for a specific user"""
     try:
+        print(f"🔍 Fetching files for user_id: {user_id}")
         cursor = files_collection.find({"user_id": user_id})
         files = []
+        count = 0
         async for doc in cursor:
+            count += 1
+            # Get upload date from ObjectId generation time or createdAt
+            upload_date = None
+            if doc.get("_id"):
+                upload_date = doc["_id"].generation_time.isoformat()
+            elif doc.get("createdAt"):
+                upload_date = doc["createdAt"].isoformat() if hasattr(doc["createdAt"], "isoformat") else str(doc["createdAt"])
+            
             files.append({
-                "_id": str(doc["_id"]),
-                "name": doc["name"],
+                "id": str(doc["_id"]),
+                "filename": doc["name"],
+                "upload_date": upload_date or "",
                 "status": doc["status"],
-                "path": doc.get("path"),
-                "createdAt": doc.get("_id").generation_time.isoformat()
-                if doc.get("_id") else None,
-                "updatedAt": doc.get("updatedAt")
+                "character_count": doc.get("character_count"),
+                "relationship_count": doc.get("relationship_count"),
             })
+        print(f"✅ Found {count} files for user_id: {user_id}")
         return files
     except Exception as e:
-        print(f"Error fetching files: {e}")
+        print(f"❌ Error fetching files: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to fetch files")
 
 
 @app.get("/files/{file_id}")
-async def get_file_status(file_id: str, user_id: str = Header(..., alias="X-User-ID")):
+async def get_file_status(file_id: str, user_id: str = Depends(get_user_id)):
     """Get status of a specific file, ensuring it belongs to the user"""
     try:
         doc = await files_collection.find_one({"_id": ObjectId(file_id), "user_id": user_id})
         if not doc:
             raise HTTPException(status_code=404, detail="File not found or access denied")
 
+        # Get upload date from ObjectId generation time or createdAt
+        upload_date = None
+        if doc.get("_id"):
+            upload_date = doc["_id"].generation_time.isoformat()
+        elif doc.get("createdAt"):
+            upload_date = doc["createdAt"].isoformat() if hasattr(doc["createdAt"], "isoformat") else str(doc["createdAt"])
+
         return {
-            "_id": str(doc["_id"]),
-            "name": doc["name"],
+            "id": str(doc["_id"]),
+            "filename": doc["name"],
+            "upload_date": upload_date or "",
             "status": doc["status"],
-            "path": doc.get("path"),
-            "createdAt": doc["_id"].generation_time.isoformat()
-            if doc.get("_id") else None,
-            "updatedAt": doc.get("updatedAt")
+            "character_count": doc.get("character_count"),
+            "relationship_count": doc.get("relationship_count"),
         }
     except Exception as e:
         print(f"Error fetching file status: {e}")
@@ -224,10 +337,192 @@ async def get_file_status(file_id: str, user_id: str = Header(..., alias="X-User
                             detail="Failed to fetch file status")
 
 
+@app.post("/files/{file_id}/reprocess")
+async def reprocess_file(file_id: str, user_id: str = Depends(get_user_id)):
+    """
+    Re-queue an existing upload for processing.
+    This is the primary recovery path if a previous run failed due to transient dependency issues.
+    """
+    try:
+        doc = await files_collection.find_one({"_id": ObjectId(file_id), "user_id": user_id})
+        if not doc:
+            raise HTTPException(status_code=404, detail="File not found or access denied")
+
+        file_path = doc.get("path")
+        if not file_path or not os.path.exists(file_path):
+            raise HTTPException(status_code=400, detail="Stored file path is missing; please re-upload the file.")
+
+        await files_collection.update_one(
+            {"_id": ObjectId(file_id), "user_id": user_id},
+            {"$set": {"status": "queued", "error": None, "character_count": None, "relationship_count": None}},
+        )
+
+        from app.workers_queue.workers import enqueue_file_processing
+        enqueue_file_processing(file_path, ObjectId(file_id), user_id)
+
+        upload_date = doc["_id"].generation_time.isoformat() if doc.get("_id") else ""
+        return {
+            "id": str(doc["_id"]),
+            "filename": doc.get("name", ""),
+            "upload_date": upload_date or "",
+            "status": "queued",
+            "character_count": None,
+            "relationship_count": None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error reprocessing file: {e}")
+        raise HTTPException(status_code=500, detail="Failed to reprocess file")
+
+
+@app.delete("/files/{file_id}")
+async def delete_file(file_id: str, user_id: str = Depends(get_user_id)):
+    """
+    Delete an upload and its derived artifacts so it disappears from the user's uploads list.
+    This addresses the UX case where a user uploaded a file but extraction failed / produced nothing.
+    """
+    try:
+        doc = await files_collection.find_one({"_id": ObjectId(file_id), "user_id": user_id})
+        if not doc:
+            raise HTTPException(status_code=404, detail="File not found or access denied")
+
+        deleted = {
+            "deleted_file_id": file_id,
+            "deleted_upload_dir": False,
+            "deleted_qdrant_chunks": 0,
+            "deleted_qdrant_memories": 0,
+            "deleted_neo4j_characters": 0,
+            "deleted_chat_sessions": 0,
+            "deleted_memories": 0,
+            "deleted_entities": 0,
+            "character_names": [],
+        }
+
+        # 0) Resolve which extracted characters belong to this file (used to cascade-delete chats/memory)
+        try:
+            driver = get_neo4j_driver()
+            with driver.session() as session:
+                res = session.run(
+                    "MATCH (c:Character {file_id: $file_id, user_id: $user_id}) RETURN c.name AS name",
+                    file_id=file_id,
+                    user_id=user_id,
+                )
+                deleted["character_names"] = [r["name"] for r in res if r.get("name")]
+        except Exception as ne:
+            print(f"Warning: failed to list Neo4j characters for file {file_id}: {ne}")
+            deleted["character_names"] = []
+
+        # 1) Delete uploaded file from disk
+        upload_dir = UPLOAD_ROOT / user_id / file_id
+        await _rm_tree(upload_dir)
+        deleted["deleted_upload_dir"] = True
+
+        # 2) Delete vector chunks from Qdrant (filter by file_id + user_id)
+        try:
+            from qdrant_client import QdrantClient
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            from app.utils.qdrant_names import qdrant_collection_name
+
+            qdrant = QdrantClient(
+                host=os.getenv("QDRANT_HOST", "qdrant"),
+                port=int(os.getenv("QDRANT_PORT", "6333")),
+            )
+            q_filter = Filter(must=[
+                FieldCondition(key="file_id", match=MatchValue(value=file_id)),
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            ])
+            base = os.getenv("QDRANT_CHUNKS_COLLECTION", "comic_chunks")
+            cols = [c.name for c in qdrant.get_collections().collections]
+            # Best-effort delete across base and dimension-suffixed variants.
+            for c in cols:
+                if c == base or c.startswith(f"{base}_d"):
+                    qdrant.delete(collection_name=c, points_selector=q_filter, wait=True)
+                    deleted["deleted_qdrant_chunks"] += 1
+        except Exception as qe:
+            # Non-fatal: we still remove the upload record to fix the user's UI.
+            print(f"Warning: failed to delete Qdrant points for file {file_id}: {qe}")
+
+        # 2b) Cascade delete chats/memories/entities associated with extracted characters from this file
+        try:
+            names = deleted["character_names"]
+            if names:
+                sessions_col = database["chat_sessions"]
+                entities_col = database["entities"]
+                memories_col = database["memories"]
+
+                # Delete sessions (contains full message history + working memory)
+                res = await sessions_col.delete_many({"user_id": user_id, "character_name": {"$in": names}})
+                deleted["deleted_chat_sessions"] = int(res.deleted_count or 0)
+
+                # Delete entities extracted for this user/character scope
+                res = await entities_col.delete_many({"user_id": user_id, "character_name": {"$in": names}})
+                deleted["deleted_entities"] = int(res.deleted_count or 0)
+
+                # Collect embedding ids before deleting memory docs
+                embedding_ids = []
+                cursor = memories_col.find(
+                    {"user_id": user_id, "character_name": {"$in": names}},
+                    projection={"embedding_id": 1},
+                )
+                async for m in cursor:
+                    eid = m.get("embedding_id")
+                    if eid:
+                        embedding_ids.append(eid)
+
+                res = await memories_col.delete_many({"user_id": user_id, "character_name": {"$in": names}})
+                deleted["deleted_memories"] = int(res.deleted_count or 0)
+
+                # Delete memory vectors from Qdrant (best-effort across base + dim-suffixed)
+                if embedding_ids:
+                    try:
+                        from qdrant_client import QdrantClient
+
+                        qdrant = QdrantClient(
+                            host=os.getenv("QDRANT_HOST", "qdrant"),
+                            port=int(os.getenv("QDRANT_PORT", "6333")),
+                        )
+                        memory_base = os.getenv("QDRANT_MEMORY_COLLECTION", "character_memories")
+                        cols = [c.name for c in qdrant.get_collections().collections]
+                        for c in cols:
+                            if c == memory_base or c.startswith(f"{memory_base}_d"):
+                                qdrant.delete(collection_name=c, points_selector=embedding_ids, wait=True)
+                                deleted["deleted_qdrant_memories"] += 1
+                    except Exception as me:
+                        print(f"Warning: failed to delete Qdrant memory vectors for file {file_id}: {me}")
+        except Exception as ce:
+            print(f"Warning: cascade delete failed for file {file_id}: {ce}")
+
+        # 3) Delete characters/relationships from Neo4j for that file+user
+        try:
+            driver = get_neo4j_driver()
+            with driver.session() as session:
+                result = session.run(
+                    "MATCH (c:Character {file_id: $file_id, user_id: $user_id}) DETACH DELETE c",
+                    file_id=file_id,
+                    user_id=user_id,
+                )
+                # Neo4j python driver does not reliably expose deleted counts; we approximate via pre-query list length
+                deleted["deleted_neo4j_characters"] = len(deleted["character_names"])
+        except Exception as ne:
+            print(f"Warning: failed to delete Neo4j nodes for file {file_id}: {ne}")
+
+        # 4) Delete file record from Mongo (this removes it from /files list)
+        await files_collection.delete_one({"_id": ObjectId(file_id), "user_id": user_id})
+
+        deleted["ok"] = True
+        return deleted
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error deleting file: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete file")
+
+
 @app.get("/characters")
 async def get_characters(
     file_id: str = Query(..., description="File ID to get characters from"),
-    user_id: str = Header(..., alias="X-User-ID")
+    user_id: str = Depends(get_user_id),
 ):
     """Get characters extracted from a processed file, verifying user ownership"""
     try:
@@ -241,8 +536,7 @@ async def get_characters(
                                 detail="File is not yet processed")
 
         # Get characters from Neo4j, filtered by file_id AND user_id for security
-        driver = GraphDatabase.driver(NEO4J_URI,
-                                      auth=(NEO4J_USER, NEO4J_PASSWORD))
+        driver = get_neo4j_driver()
         with driver.session() as session:
             result = session.run(
                 "MATCH (c:Character {file_id: $file_id, user_id: $user_id}) RETURN c.name as name, c.description as description, c.powers as powers, c.story_arcs as story_arcs",
@@ -260,7 +554,6 @@ async def get_characters(
                 }
                 characters.append(character)
 
-        driver.close()
         return characters
 
     except Exception as e:
@@ -270,11 +563,10 @@ async def get_characters(
 
 
 @app.get("/characters/{character_name}")
-async def get_character_profile(character_name: str, user_id: str = Header(..., alias="X-User-ID")):
+async def get_character_profile(character_name: str, user_id: str = Depends(get_user_id)):
     """Get detailed profile of a specific character, ensuring it belongs to the user"""
     try:
-        driver = GraphDatabase.driver(NEO4J_URI,
-                                      auth=(NEO4J_USER, NEO4J_PASSWORD))
+        driver = get_neo4j_driver()
         with driver.session() as session:
             # Get character details, filtering by name AND user_id
             result = session.run(
@@ -319,7 +611,6 @@ async def get_character_profile(character_name: str, user_id: str = Header(..., 
                 "emotional_state": "neutral",  # Default
                 "motivations": []  # Could be extracted from description
             }
-        driver.close()
         return profile
 
     except Exception as e:
@@ -328,11 +619,10 @@ async def get_character_profile(character_name: str, user_id: str = Header(..., 
 
 
 @app.get("/characters/{character_name}/relationships")
-async def get_character_relationships(character_name: str, user_id: str = Header(..., alias="X-User-ID")):
+async def get_character_relationships(character_name: str, user_id: str = Depends(get_user_id)):
     """Get relationships for a specific character, ensuring it belongs to the user"""
     try:
-        driver = GraphDatabase.driver(NEO4J_URI,
-                                      auth=(NEO4J_USER, NEO4J_PASSWORD))
+        driver = get_neo4j_driver()
         with driver.session() as session:
             result = session.run(
                 """
@@ -352,7 +642,6 @@ async def get_character_relationships(character_name: str, user_id: str = Header
                     "description": f"{character_name} has a {record['type']} relationship with {record['target']}"
                 })
 
-        driver.close()
         return {"character": character_name, "relationships": relationships}
 
     except Exception as e:
@@ -361,12 +650,12 @@ async def get_character_relationships(character_name: str, user_id: str = Header
 
 
 @app.get("/characters/{character_name}/status")
-async def get_character_status(character_name: str, user_id: str = Header(..., alias="X-User-ID")):
+async def get_character_status(character_name: str, user_id: str = Depends(get_user_id)):
     """
     Check if a character is ready for chat, ensuring it belongs to the user
     Returns readiness status and processing state
     """
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    driver = get_neo4j_driver()
     
     try:
         with driver.session() as session:
@@ -415,8 +704,9 @@ async def get_character_status(character_name: str, user_id: str = Header(..., a
                     "message": f"Character '{character_name}' not found. Still processing?",
                     "can_chat": False
                 }
-    finally:
-        driver.close()
+    except Exception as e:
+        print(f"Error checking character status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to check character status")
 
 
 def get_status_message(status: str) -> str:
@@ -432,67 +722,69 @@ def get_status_message(status: str) -> str:
     return messages.get(status, "Processing...")
 
 
-@app.post("/chat")
+@app.post("/chat", deprecated=True, tags=["Chat (deprecated)"])
 async def chat_with_character_endpoint(
-    request: ChatRequest,
-    user_id: str = Header(..., alias="X-User-ID")
+    request: LegacyChatRequest,
+    response: Response,
+    user_id: str = Depends(get_user_id),
+    chat_service: ChatService = Depends(get_chat_service),
 ):
-    """Chat with a character - with status validation and user context"""
-    
-    # Simple validation to ensure request's user_id matches header
-    if request.user_id != user_id:
-        raise HTTPException(status_code=403, detail="User ID mismatch")
+    """
+    DEPRECATED: Legacy chat endpoint.
 
-    # Check if character is ready
-    status_response = await get_character_status(request.character_name, user_id)
-    
-    if not status_response["can_chat"]:
-        raise HTTPException(
-            status_code=425,  # Too Early
-            detail={
-                "message": status_response["message"],
-                "status": status_response.get("status", "not_ready"),
-                "ready": False
-            }
-        )
-    
-    # Character is ready (possibly with warning)
-    try:
-        response = chat_with_character(request)
-        
-        # Add warning if relationships still processing
-        if status_response.get("warning"):
-            response["warning"] = status_response["warning"]
-        
-        return response
-    except Exception as e:
-        print(f"Error in chat: {e}")
-        raise HTTPException(status_code=500, detail="Chat failed")
+    This endpoint is kept for backwards compatibility, but it now routes through
+    the v2 chat service (memory + provider abstraction + metrics).
+
+    Use: POST /v2/chat
+    """
+    response.headers["Deprecation"] = "true"
+    response.headers["Link"] = '</v2/chat>; rel="successor-version"'
+
+    result = await chat_service.chat(
+        user_id=user_id,
+        character_name=request.character_name,
+        message=request.message,
+    )
+
+    if result.error:
+        if result.error == "CHARACTER_NOT_FOUND":
+            raise HTTPException(status_code=404, detail=result.response)
+        raise HTTPException(status_code=500, detail=result.error)
+
+    # Keep legacy shape but include v2 metadata for clients that want it
+    return {
+        "response": result.response,
+        "character": result.character,
+        "timestamp": result.timestamp,
+        "session_id": result.session_id,
+        "memories_used": result.memories_used,
+        "is_new_session": result.is_new_session,
+        "tokens_used": result.tokens_used,
+    }
 
 
-@app.post("/chat/stream")
+@app.post("/chat/stream", deprecated=True, tags=["Chat (deprecated)"])
 async def chat_with_character_stream(
-    request: ChatRequest,
-    user_id: str = Header(..., alias="X-User-ID")
+    request: LegacyChatRequest,
+    user_id: str = Depends(get_user_id),
+    chat_service: ChatService = Depends(get_chat_service),
 ):
     """
-    Streaming chat endpoint - responses appear word-by-word
-    Provides real-time status updates and progressive response delivery
+    DEPRECATED: Legacy streaming chat endpoint.
+
+    This endpoint is kept for backwards compatibility, but it now routes through
+    the v2 chat service streaming path (true provider streaming when available).
+
+    Use: POST /v2/chat/stream
     """
-    # Simple validation to ensure request's user_id matches header
-    if request.user_id != user_id:
-        raise HTTPException(status_code=403, detail="User ID mismatch")
-        
     async def generate_response() -> AsyncGenerator[str, None]:
         try:
-            # Import here to avoid circular dependency
-            from app.workers_queue.workers import chat_with_character_streaming
-            
-            # Stream the response
-            async for chunk in chat_with_character_streaming(request):
-                # Send as Server-Sent Events (SSE) format
+            async for chunk in chat_service.chat_stream(
+                user_id=user_id,
+                character_name=request.character_name,
+                message=request.message,
+            ):
                 yield f"data: {json.dumps(chunk)}\n\n"
-                
         except Exception as e:
             error_msg = {"type": "error", "message": str(e)}
             yield f"data: {json.dumps(error_msg)}\n\n"
@@ -509,8 +801,10 @@ async def chat_with_character_stream(
 
 
 @app.get("/chat/history")
-async def get_chat_history(character: str = Query(..., description="Character name"),
-                           user_id: str = Header(..., alias="X-User-ID")):
+async def get_chat_history(
+    character: str = Query(..., description="Character name"),
+    user_id: str = Depends(get_user_id),
+):
     """Get chat history for a user-character pair"""
     from motor.motor_asyncio import AsyncIOMotorClient
     mongo = AsyncIOMotorClient(MONGODB_URI)
@@ -536,8 +830,10 @@ async def get_chat_history(character: str = Query(..., description="Character na
 
 
 @app.delete("/chat/history")
-async def clear_chat_history(character: str = Query(..., description="Character name"),
-                             user_id: str = Header(..., alias="X-User-ID")):
+async def clear_chat_history(
+    character: str = Query(..., description="Character name"),
+    user_id: str = Depends(get_user_id),
+):
     """Clear chat history for a user-character pair"""
     from motor.motor_asyncio import AsyncIOMotorClient
     mongo = AsyncIOMotorClient(MONGODB_URI)
@@ -570,3 +866,47 @@ async def http_exception_handler(request, exc):
         status_code=exc.status_code,
         content={"detail": exc.detail}
     )
+
+
+# Startup handler
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup."""
+    print("🚀 Starting Character Chat API...")
+    
+    # Initialize chat service (LLM, memory, etc.)
+    try:
+        manager = get_chat_manager()
+        await manager.initialize()
+    except Exception as e:
+        print(f"⚠️ Chat service initialization failed: {e}")
+        print("   Chat v2 endpoints will initialize on first request.")
+    
+    # Initialize character library (seeds pre-built characters)
+    try:
+        from app.characters.service import get_character_service
+        print("📚 Initializing Character Library...")
+        await get_character_service()
+        print("✅ Character Library ready!")
+    except Exception as e:
+        print(f"⚠️ Character library initialization failed: {e}")
+
+
+# Shutdown handlers for graceful cleanup
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up database connections on shutdown."""
+    global _neo4j_driver
+    
+    # Close Neo4j
+    if _neo4j_driver is not None:
+        _neo4j_driver.close()
+        _neo4j_driver = None
+        print("Neo4j driver closed")
+    
+    # Close chat service
+    try:
+        manager = get_chat_manager()
+        await manager.shutdown()
+    except Exception as e:
+        print(f"Chat service shutdown error: {e}")

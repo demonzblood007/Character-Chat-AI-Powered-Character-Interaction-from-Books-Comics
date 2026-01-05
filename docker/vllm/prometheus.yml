@@ -1,0 +1,62 @@
+# ============================================================================
+# Prometheus Configuration for vLLM Monitoring
+# ============================================================================
+#
+# LEARNING NOTES:
+#
+# Prometheus scrapes metrics from vLLM at regular intervals.
+# vLLM exposes metrics at /metrics endpoint in Prometheus format.
+#
+# Key metrics to understand:
+# - vllm:num_requests_running: Currently processing requests
+# - vllm:num_requests_waiting: Requests in queue
+# - vllm:gpu_cache_usage_perc: KV cache utilization
+# - vllm:avg_generation_throughput_toks_per_s: Tokens generated per second
+#
+# ============================================================================
+
+global:
+  scrape_interval: 15s     # How often to scrape metrics
+  evaluation_interval: 15s  # How often to evaluate rules
+  
+  # Labels added to all metrics
+  external_labels:
+    monitor: 'character-chat'
+
+# Alerting (optional, can connect to AlertManager)
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# Rule files (optional)
+rule_files: []
+
+# Scrape configurations
+scrape_configs:
+  # ────────────────────────────────────────────────────────────────────────
+  # vLLM Metrics
+  # ────────────────────────────────────────────────────────────────────────
+  - job_name: 'vllm'
+    static_configs:
+      - targets: ['vllm:8000']
+    
+    # vLLM metrics path
+    metrics_path: /metrics
+    
+    # Scrape more frequently for real-time monitoring
+    scrape_interval: 5s
+    
+    # Relabel to add instance label
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'vllm-server'
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Prometheus Self-Monitoring
+  # ────────────────────────────────────────────────────────────────────────
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+

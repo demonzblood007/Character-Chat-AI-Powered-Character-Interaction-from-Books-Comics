@@ -256,6 +256,7 @@ class E2ETest:
             
             response = requests.get(
                 f"{API_BASE_URL}/characters/{test_character}/relationships",
+                headers=self._headers(),
                 timeout=10
             )
             response.raise_for_status()
@@ -313,9 +314,8 @@ class E2ETest:
             start_time = time.time()
             
             response = requests.post(
-                f"{API_BASE_URL}/chat",
+                f"{API_BASE_URL}/v2/chat",
                 json={
-                    "user_id": test_user,
                     "character_name": test_character,
                     "message": test_message
                 },
@@ -361,9 +361,8 @@ class E2ETest:
             # Send a message
             log_info("Sending first message...")
             response1 = requests.post(
-                f"{API_BASE_URL}/chat",
+                f"{API_BASE_URL}/v2/chat",
                 json={
-                    "user_id": test_user,
                     "character_name": test_character,
                     "message": "Tell me about your greatest strength"
                 },
@@ -372,32 +371,27 @@ class E2ETest:
             )
             response1.raise_for_status()
             
-            # Retrieve history
-            log_info("Retrieving chat history...")
-            history_response = requests.get(
-                f"{API_BASE_URL}/chat/history",
+            # Verify conversation persistence via v2 summary
+            log_info("Retrieving v2 conversation summary...")
+            summary_response = requests.get(
+                f"{API_BASE_URL}/v2/chat/summary",
                 params={"character": test_character},
                 headers=self._headers(test_user),
-                timeout=5
+                timeout=10
             )
-            history_response.raise_for_status()
-            history_data = history_response.json()
+            summary_response.raise_for_status()
+            summary_data = summary_response.json()
             
-            messages = history_data.get("messages", [])
+            total_messages = summary_data.get("total_messages", 0)
+            assert total_messages >= 2, f"Expected at least 2 messages, got {total_messages}"
             
-            # Verify messages were saved
-            assert len(messages) >= 2, "Expected at least 2 messages (user + assistant)"
-            
-            log_success(f"Chat history saved: {len(messages)} messages")
-            log_info(f"  User message: '{messages[-2].get('content', '')[:50]}...'")
-            log_info(f"  Assistant message: '{messages[-1].get('content', '')[:50]}...'")
+            log_success(f"Chat history saved (v2) - total_messages: {total_messages}")
             
             # Send follow-up to test conversation memory
             log_info("Sending follow-up message...")
             response2 = requests.post(
-                f"{API_BASE_URL}/chat",
+                f"{API_BASE_URL}/v2/chat",
                 json={
-                    "user_id": test_user,
                     "character_name": test_character,
                     "message": "What did you just tell me about?"
                 },
@@ -406,19 +400,20 @@ class E2ETest:
             )
             response2.raise_for_status()
             
-            # Verify history updated
-            history_response2 = requests.get(
-                f"{API_BASE_URL}/chat/history",
+            # Verify summary updated
+            summary_response2 = requests.get(
+                f"{API_BASE_URL}/v2/chat/summary",
                 params={"character": test_character},
                 headers=self._headers(test_user),
-                timeout=5
+                timeout=10
             )
-            history_data2 = history_response2.json()
-            messages2 = history_data2.get("messages", [])
+            summary_response2.raise_for_status()
+            summary_data2 = summary_response2.json()
             
-            assert len(messages2) > len(messages), "History didn't update after second message"
+            total_messages2 = summary_data2.get("total_messages", 0)
+            assert total_messages2 > total_messages, "Summary didn't update after second message"
             
-            log_success("Conversation memory working - history persisted and updated")
+            log_success("Conversation memory working (v2) - summary persisted and updated")
             return True
             
         except Exception as e:
@@ -435,13 +430,13 @@ class E2ETest:
         
         try:
             test_character = self.characters[0]['name']
+            stream_user = f"{self.user_id}-stream"
             
             log_info(f"Testing streaming chat with: {test_character}")
             
             response = requests.post(
-                f"{API_BASE_URL}/chat/stream",
+                f"{API_BASE_URL}/v2/chat/stream",
                 json={
-                    "user_id": stream_user,
                     "character_name": test_character,
                     "message": "Hi there!"
                 },

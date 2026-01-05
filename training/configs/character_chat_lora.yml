@@ -1,0 +1,226 @@
+# ============================================================================
+# Axolotl Configuration for Character Chat Fine-Tuning
+# ============================================================================
+#
+# LEARNING NOTES:
+#
+# This config fine-tunes Llama 3.1 8B to be better at character roleplay.
+# Each section is heavily commented to explain what it does and why.
+#
+# To run: accelerate launch -m axolotl.cli.train training/configs/character_chat_lora.yml
+#
+# ============================================================================
+
+# ────────────────────────────────────────────────────────────────────────────
+# Model Configuration
+# ────────────────────────────────────────────────────────────────────────────
+
+# Base model to fine-tune
+# Using the instruction-tuned version because it already follows instructions
+base_model: meta-llama/Llama-3.1-8B-Instruct
+
+# Model type (for proper tokenizer handling)
+model_type: LlamaForCausalLM
+
+# Trust remote code (needed for some models)
+trust_remote_code: true
+
+# Use Flash Attention 2 if available (much faster training)
+# Requires: pip install flash-attn --no-build-isolation
+flash_attention: true
+
+# ────────────────────────────────────────────────────────────────────────────
+# LoRA Configuration
+# ────────────────────────────────────────────────────────────────────────────
+
+# Use LoRA instead of full fine-tuning
+# This is the key to efficient fine-tuning
+adapter: lora
+
+# LoRA rank (r)
+# Higher = more capacity but more memory
+# 8-16 for simple tasks, 32-64 for complex tasks
+# Character voice is moderately complex, so r=16
+lora_r: 16
+
+# LoRA alpha (scaling factor)
+# Rule of thumb: alpha = 2 × r
+# This controls how much the LoRA weights affect output
+lora_alpha: 32
+
+# Dropout for regularization
+# Helps prevent overfitting
+# 0.05-0.1 is typical
+lora_dropout: 0.05
+
+# Which modules to apply LoRA to
+# q_proj, k_proj, v_proj, o_proj = attention layers
+# These are most important for learning new behaviors
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  # Optionally add these for more capacity:
+  # - gate_proj
+  # - up_proj
+  # - down_proj
+
+# Linear layers to target (alternative to target_modules)
+lora_target_linear: false
+
+# Fan-in/fan-out initialization
+lora_fan_in_fan_out: false
+
+# ────────────────────────────────────────────────────────────────────────────
+# Dataset Configuration
+# ────────────────────────────────────────────────────────────────────────────
+
+datasets:
+  # Primary training dataset
+  - path: training/data/character_chat.jsonl
+    type: sharegpt
+    # ShareGPT format:
+    # {"conversations": [{"from": "system", "value": "..."}, {"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]}
+    
+    # Conversation field names (ShareGPT format)
+    conversation: conversations
+    
+    # Field mappings
+    field_human: human
+    field_model: gpt
+    field_system: system
+
+# Dataset mixing (if you have multiple datasets)
+# dataset_shard_num: 1
+# dataset_shard_idx: 0
+
+# Validation split
+val_set_size: 0.05
+
+# ────────────────────────────────────────────────────────────────────────────
+# Tokenization
+# ────────────────────────────────────────────────────────────────────────────
+
+# Maximum sequence length
+# Llama 3.1 supports 128K, but we limit for memory
+# 2048 is enough for most conversations
+sequence_len: 2048
+
+# Padding strategy
+# right = pad on right side (standard for causal LM)
+pad_to_sequence_len: false
+
+# Sample packing (combine short samples into one)
+# Improves training efficiency
+sample_packing: true
+
+# ────────────────────────────────────────────────────────────────────────────
+# Training Configuration
+# ────────────────────────────────────────────────────────────────────────────
+
+# Batch sizes
+# micro_batch_size = per-GPU batch size
+# gradient_accumulation_steps = steps before optimizer update
+# effective_batch_size = micro_batch × accumulation × num_gpus
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+# With 1 GPU: effective batch = 1 × 8 × 1 = 8
+
+# Number of epochs (passes through data)
+# 2-4 epochs is typical for LoRA
+# More epochs risks overfitting
+num_epochs: 3
+
+# Learning rate
+# 1e-4 to 3e-4 works well for LoRA
+# Start conservative (2e-4), increase if loss plateaus
+learning_rate: 2e-4
+
+# Learning rate scheduler
+# cosine = starts high, smoothly decreases
+# Other options: constant, linear, polynomial
+lr_scheduler: cosine
+
+# Warmup steps
+# Gradually increase LR from 0 to learning_rate
+# Prevents initial instability
+warmup_steps: 100
+
+# Weight decay (L2 regularization)
+# Helps prevent overfitting
+weight_decay: 0.01
+
+# Optimizer
+# adamw_torch = standard AdamW
+# adamw_8bit = uses less memory
+# adamw_bnb_8bit = BitsAndBytes 8-bit (most memory efficient)
+optimizer: adamw_torch
+
+# ────────────────────────────────────────────────────────────────────────────
+# Memory Optimization
+# ────────────────────────────────────────────────────────────────────────────
+
+# Use bfloat16 mixed precision
+# Better than fp16 for training (larger dynamic range)
+# Requires Ampere GPU or newer (RTX 30xx, A100)
+bf16: true
+
+# Gradient checkpointing
+# Trades compute for memory by recomputing activations
+# ~30% slower but ~50% less memory
+gradient_checkpointing: true
+
+# ────────────────────────────────────────────────────────────────────────────
+# Logging and Checkpoints
+# ────────────────────────────────────────────────────────────────────────────
+
+# Output directory for checkpoints and final model
+output_dir: ./training/output/character-chat-lora
+
+# Logging
+logging_steps: 10
+report_to: tensorboard
+
+# Checkpointing
+# Save every N steps
+save_steps: 500
+save_total_limit: 3  # Keep only last 3 checkpoints
+
+# Evaluation
+eval_steps: 500
+do_eval: true
+
+# ────────────────────────────────────────────────────────────────────────────
+# Hub Configuration (Optional)
+# ────────────────────────────────────────────────────────────────────────────
+
+# Push to HuggingFace Hub (uncomment to enable)
+# hub_model_id: your-username/character-chat-lora
+# push_to_hub: true
+# hub_strategy: checkpoint
+
+# ────────────────────────────────────────────────────────────────────────────
+# Special Tokens
+# ────────────────────────────────────────────────────────────────────────────
+
+# Use Llama 3 chat template
+chat_template: llama3
+
+# Tokens for masking (don't train on these)
+# We want to train on assistant responses, not user messages
+train_on_inputs: false
+
+# ────────────────────────────────────────────────────────────────────────────
+# Performance
+# ────────────────────────────────────────────────────────────────────────────
+
+# Number of dataloader workers
+num_workers: 4
+
+# Seed for reproducibility
+seed: 42
+
+# TF32 for faster training on Ampere GPUs
+tf32: true
+

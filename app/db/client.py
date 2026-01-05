@@ -1,4 +1,5 @@
 import os
+import atexit
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import MongoClient
 
@@ -27,3 +28,20 @@ def get_async_database():
 def get_sync_database():
     """Return the sync database handle."""
     return _sync_client[MONGODB_DB]
+
+
+def close_connections():
+    """Close all MongoDB connections gracefully."""
+    global _async_client, _sync_client
+    try:
+        if _async_client is not None:
+            _async_client.close()
+        if _sync_client is not None:
+            _sync_client.close()
+        print("MongoDB connections closed")
+    except Exception as e:
+        print(f"Error closing MongoDB connections: {e}")
+
+
+# Register cleanup function to run at exit
+atexit.register(close_connections)

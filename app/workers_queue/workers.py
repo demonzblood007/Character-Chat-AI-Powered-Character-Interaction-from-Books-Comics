@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Optional, TypedDict, Coroutine
 import fitz  # PyMuPDF
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import StateGraph, END, START
 from neo4j import GraphDatabase
@@ -33,6 +32,11 @@ from qdrant_client import QdrantClient, models
 from rq import Retry
 from qdrant_client.models import VectorParams, Distance, PointStruct, Filter, FieldCondition, MatchValue
 from app.workers_queue.q import q
+from app.utils.qdrant_compat import query_points_compat
+from app.utils.qdrant_names import qdrant_collection_name_for_dim, qdrant_collection_name_for_vector
+from app.llm import get_llm, get_embeddings
+from app.llm.providers.base import BaseLLM, BaseEmbeddings
+import httpx
 
 # Load environment variables from .env file
 load_dotenv()
@@ -40,12 +44,16 @@ load_dotenv()
 # ────────────────────────────────
 # Logging Configuration
 # ────────────────────────────────
+# Ensure logs directory exists
+LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'logs')
+os.makedirs(LOGS_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('logs/worker.log') if os.path.exists('logs') else logging.StreamHandler()
+        logging.FileHandler(os.path.join(LOGS_DIR, 'worker.log'))
     ]
 )
 
@@ -56,10 +64,10 @@ logger = logging.getLogger(__name__)
 # ────────────────────────────────
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/character_chat")
 MONGODB_DB = os.getenv("MONGODB_DB", "character_chat")
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
-QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
 
 # LLM Configuration
@@ -82,6 +90,9 @@ EMBEDDING_DIMENSIONS = {
     "text-embedding-3-large": 3072,
     "text-embedding-3-small": 1536,
     "text-embedding-ada-002": 1536,
+    # Ollama / local embedding models (common defaults)
+    "nomic-embed-text": 768,
+    "mxbai-embed-large": 1024,
     # Add other providers as needed
     # "sentence-transformers/all-MiniLM-L6-v2": 384,
     # "BAAI/bge-large-en-v1.5": 1024,
@@ -151,6 +162,46 @@ class OpenAILLM(AbstractLLM):
     def get_model_name(self) -> str:
         return self.model
 
+class OllamaLLM(AbstractLLM):
+    """
+    Minimal Ollama text generation wrapper for the worker.
+    Uses /api/generate with stream disabled.
+    """
+    def __init__(self, model: str, temperature: float, base_url: str):
+        self.model = model
+        self.temperature = temperature
+        self.base_url = (base_url or "http://localhost:11434").rstrip("/")
+
+    def invoke(self, prompt: str) -> str:
+        url = f"{self.base_url}/api/generate"
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": self.temperature},
+        }
+        r = httpx.post(url, json=payload, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("response", "") or ""
+
+    async def ainvoke(self, prompt: str) -> Coroutine[Any, Any, str]:
+        url = f"{self.base_url}/api/generate"
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": self.temperature},
+        }
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            return data.get("response", "") or ""
+
+    def get_model_name(self) -> str:
+        return self.model
+
 class OpenAIEmbeddingsWrapper(AbstractEmbeddings):
     def __init__(self, model: str, api_key: str, base_url: Optional[str] = None):
         self.model = model
@@ -166,30 +217,39 @@ class OpenAIEmbeddingsWrapper(AbstractEmbeddings):
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         return self.client.embed_documents(texts)
 
-def create_llm() -> OpenAILLM:
-    if not LLM_API_KEY:
-        raise ValueError("LLM_API_KEY environment variable is required")
-    if LLM_PROVIDER == "openai":
-        return OpenAILLM(
-            model=LLM_MODEL,
-            temperature=LLM_TEMPERATURE,
-            api_key=LLM_API_KEY,
-            base_url=LLM_BASE_URL
-        )
-    else:
-        raise ValueError(f"Unsupported LLM provider: {LLM_PROVIDER}")
+class OllamaEmbeddingsWrapper(AbstractEmbeddings):
+    """
+    Minimal Ollama embeddings wrapper for the worker.
+    Uses /api/embeddings (one prompt at a time).
+    """
+    def __init__(self, model: str, base_url: str):
+        self.model = model
+        self.base_url = (base_url or "http://localhost:11434").rstrip("/")
 
-def create_embeddings() -> AbstractEmbeddings:
-    if not EMBEDDING_API_KEY:
-        raise ValueError("EMBEDDING_API_KEY environment variable is required")
-    if EMBEDDING_PROVIDER == "openai":
-        return OpenAIEmbeddingsWrapper(
-            model=EMBEDDING_MODEL,
-            api_key=EMBEDDING_API_KEY,
-            base_url=EMBEDDING_BASE_URL
-        )
-    else:
-        raise ValueError(f"Unsupported embedding provider: {EMBEDDING_PROVIDER}")
+    def embed_query(self, text: str) -> List[float]:
+        url = f"{self.base_url}/api/embeddings"
+        r = httpx.post(url, json={"model": self.model, "prompt": text}, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("embedding", []) or []
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        # Ollama embeddings endpoint is single-prompt; do a simple loop.
+        return [self.embed_query(t) for t in texts]
+
+def create_llm() -> BaseLLM:
+    """
+    Create an LLM using the shared provider-agnostic factory (env-driven).
+    Supports: OpenAI, vLLM, Ollama.
+    """
+    return get_llm()
+
+def create_embeddings() -> BaseEmbeddings:
+    """
+    Create embeddings using the shared provider-agnostic factory (env-driven).
+    Supports: OpenAI, vLLM, Ollama/local.
+    """
+    return get_embeddings()
 
 # ────────────────────────────────
 # State Management
@@ -336,21 +396,31 @@ def chunk_text(text: str, chunk_size: int = None, overlap: int = None) -> List[s
 # ────────────────────────────────
 # Qdrant Integration
 # ────────────────────────────────
-def ensure_qdrant_collection(client: QdrantClient, name: str) -> None:
+def ensure_qdrant_collection(client: QdrantClient, name: str, size: int) -> None:
+    """
+    Ensure Qdrant collection exists with the given vector size.
+
+    Important: do NOT rely on VECTOR_SIZE env var here; use the actual embedding
+    vector length (size) to avoid dimension mismatch errors.
+    """
     if name not in [c.name for c in client.get_collections().collections]:
         client.create_collection(
             collection_name=name,
             vectors_config=VectorParams(
-                size=VECTOR_SIZE, distance=Distance.COSINE
+                size=int(size), distance=Distance.COSINE
             ),
         )
 
 def store_chunks_in_qdrant(chunks: List[str], file_id: str, embeddings: AbstractEmbeddings, user_id: str):
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-    ensure_qdrant_collection(client, "comic_chunks")
+    base = os.getenv("QDRANT_CHUNKS_COLLECTION", "comic_chunks")
+    # Use the actual embedding vector dimension to pick the right collection.
     vectors = embeddings.embed_documents(chunks)
+    dim = len(vectors[0]) if vectors else VECTOR_SIZE
+    collection = qdrant_collection_name_for_dim(base, dim)
+    ensure_qdrant_collection(client, collection, dim)
     client.upload_collection(
-        collection_name="comic_chunks",
+        collection_name=collection,
         vectors=vectors,
         payload=[{"type": "chunk", "file_id": file_id, "text": chunk, "user_id": user_id} for chunk in chunks],
         ids=[str(uuid.uuid4()) for _ in vectors],
@@ -383,13 +453,25 @@ def retrieve_context_from_qdrant(query: str, k: int = 4, file_id: Optional[str] 
     if user_id:
         filter_conditions.append(FieldCondition(key="user_id", match=MatchValue(value=user_id)))
     
-    search = client.search(
-        collection_name="comic_chunks",
+    q_filter = Filter(must=filter_conditions) if filter_conditions else None
+
+    collection = qdrant_collection_name_for_vector(os.getenv("QDRANT_CHUNKS_COLLECTION", "comic_chunks"), v)
+    points = query_points_compat(
+        client,
+        collection_name=collection,
         query_vector=v,
         limit=k,
-        query_filter=Filter(must=filter_conditions) if filter_conditions else None,
+        query_filter=q_filter,
+        with_payload=True,
     )
-    return "\n".join([hit.payload.get("text", "") for hit in search])
+
+    texts: List[str] = []
+    for hit in points:
+        payload = getattr(hit, "payload", None) or {}
+        text = payload.get("text", "")
+        if text:
+            texts.append(text)
+    return "\n".join(texts)
 
 # ────────────────────────────────
 # Neo4j Integration
@@ -536,9 +618,11 @@ async def node_extract_characters(state: ComicState) -> ComicState:
     """Extract characters from ALL chunks in parallel, then deduplicate and resolve aliases"""
     llm = create_llm()
     semaphore = state["semaphore"]
+    error_count = 0
     
     # Phase 1: Parallel extraction from all chunks
     async def extract_from_chunk(chunk: str) -> List[str]:
+        nonlocal error_count
         prompt = f"""
         Extract all character names (people) from this text section. 
         Return only a JSON array of names, nothing else.
@@ -552,8 +636,17 @@ async def node_extract_characters(state: ComicState) -> ComicState:
             response = response.strip().strip("```json").strip("```").strip()
             return json.loads(response)
         except (json.JSONDecodeError, TypeError):
+            # Model responded but not valid JSON; treat as a soft failure for this chunk.
+            error_count += 1
             return []
-        except Exception:
+        except Exception as e:
+            # Hard failure (network/model missing/etc). Count it so we can fail the job
+            # instead of silently "succeeding" with 0 characters.
+            error_count += 1
+            try:
+                logger.warning(f"Character extraction failed for a chunk: {type(e).__name__}: {e}")
+            except Exception:
+                pass
             return []
 
     chunks = state.get("chunks", [])
@@ -565,6 +658,18 @@ async def node_extract_characters(state: ComicState) -> ComicState:
     # Store all mentions
     state["all_character_mentions"] = all_mentions
     print(f"Total character mentions across all chunks: {len(all_mentions)}")
+
+    # If we got zero mentions but had failures, treat it as a pipeline failure (not a valid "0 characters" result).
+    # This prevents marking the file as 'done' when the model is missing or the backend is unreachable.
+    if len(all_mentions) == 0 and error_count > 0:
+        provider = os.getenv("LLM_PROVIDER", "openai")
+        base_url = os.getenv("LLM_BASE_URL", "")
+        model = os.getenv("LLM_MODEL", "")
+        raise RuntimeError(
+            f"LLM character extraction failed for {error_count}/{len(chunks)} chunks. "
+            f"provider={provider} model={model} base_url={base_url}. "
+            "Fix by setting env vars correctly and ensuring the model is available (e.g., `ollama pull <model>` or vLLM is running)."
+        )
     
     # Phase 2: Deduplicate and resolve aliases (single LLM call)
     if all_mentions:
@@ -897,6 +1002,23 @@ async def process_pdf_file_async(file_record: Dict[str, Any]) -> None:
             await update_status("failed", error=f"DB health check failed: {db_error}")
             return
 
+        # --- LLM/Embeddings Preflight (fail fast, avoid '0 characters' from misconfig) ---
+        try:
+            llm = create_llm()
+            ok = await llm.health_check()
+            if not ok:
+                await update_status(
+                    "failed",
+                    error=(
+                        "LLM health check failed. Check LLM_PROVIDER/LLM_MODEL/LLM_BASE_URL "
+                        "(inside Docker, localhost will not reach host services)."
+                    ),
+                )
+                return
+        except Exception as e:
+            await update_status("failed", error=f"LLM initialization/health check failed: {type(e).__name__}: {e}")
+            return
+
         is_valid, validation_error = validate_pdf_file(file_path)
         if not is_valid:
             await update_status("failed", error=validation_error)
@@ -934,6 +1056,22 @@ async def process_pdf_file_async(file_record: Dict[str, Any]) -> None:
             # --- Final Status Update ---
             character_count = len(final_state.get("characters", []))
             relationship_count = len(final_state.get("relationships", []))
+            mention_count = len(final_state.get("all_character_mentions", []) or [])
+
+            # If we extracted candidate mentions but ended up saving 0 character profiles,
+            # this is almost always a downstream failure (e.g., retrieval/LLM step) and should not be marked "done".
+            if character_count == 0 and mention_count > 0:
+                await update_status(
+                    "failed",
+                    character_count=0,
+                    relationship_count=0,
+                    processed_at=datetime.utcnow(),
+                    error=(
+                        "Character extraction produced candidate mentions but no character profiles were saved. "
+                        "This indicates a downstream failure during character detail extraction. Please retry or delete this upload."
+                    ),
+                )
+                return
 
             await update_status(
                 "done",

@@ -1,0 +1,133 @@
+# ============================================================================
+# QLoRA Configuration for Character Chat
+# ============================================================================
+#
+# LEARNING NOTES:
+#
+# QLoRA = Quantized LoRA
+# The base model is loaded in 4-bit precision, reducing VRAM by ~4x
+# LoRA adapters are trained in full precision on top
+#
+# Memory comparison:
+#   Full precision (fp16): 16 GB for 8B model
+#   QLoRA (4-bit):         ~5 GB for 8B model
+#
+# Quality is ~95% of full LoRA with ~75% of the memory
+#
+# Use QLoRA when:
+#   - You have limited VRAM (< 24GB)
+#   - You're prototyping and want fast iteration
+#   - Quality requirements are not extreme
+#
+# ============================================================================
+
+# ────────────────────────────────────────────────────────────────────────────
+# Model Configuration (same as LoRA)
+# ────────────────────────────────────────────────────────────────────────────
+
+base_model: meta-llama/Llama-3.1-8B-Instruct
+model_type: LlamaForCausalLM
+trust_remote_code: true
+
+# Flash Attention (if available)
+flash_attention: true
+
+# ────────────────────────────────────────────────────────────────────────────
+# QLoRA-Specific Configuration
+# ────────────────────────────────────────────────────────────────────────────
+
+# Enable QLoRA (4-bit quantization)
+adapter: qlora
+
+# 4-bit quantization settings
+load_in_4bit: true
+
+# BitsAndBytes quantization config
+bnb_4bit_compute_dtype: bfloat16  # Compute in bf16 for quality
+bnb_4bit_quant_type: nf4          # NormalFloat4 (better than int4)
+bnb_4bit_use_double_quant: true   # Double quantization for more savings
+
+# LoRA settings (applied on top of quantized model)
+lora_r: 32           # Can use higher rank since base is quantized
+lora_alpha: 64       # 2 × r
+lora_dropout: 0.05
+
+# Target modules
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj  # Include MLP layers for more capacity
+
+# ────────────────────────────────────────────────────────────────────────────
+# Dataset Configuration
+# ────────────────────────────────────────────────────────────────────────────
+
+datasets:
+  - path: training/data/character_chat.jsonl
+    type: sharegpt
+    conversation: conversations
+    field_human: human
+    field_model: gpt
+    field_system: system
+
+val_set_size: 0.05
+
+# ────────────────────────────────────────────────────────────────────────────
+# Tokenization
+# ────────────────────────────────────────────────────────────────────────────
+
+sequence_len: 2048
+pad_to_sequence_len: false
+sample_packing: true
+
+# ────────────────────────────────────────────────────────────────────────────
+# Training Configuration
+# ────────────────────────────────────────────────────────────────────────────
+
+# Can use larger micro_batch with QLoRA due to memory savings
+micro_batch_size: 2
+gradient_accumulation_steps: 4
+# Effective batch = 2 × 4 = 8
+
+num_epochs: 3
+learning_rate: 2e-4
+lr_scheduler: cosine
+warmup_steps: 100
+weight_decay: 0.01
+
+# Use paged optimizer (more memory efficient)
+optimizer: paged_adamw_8bit
+
+# ────────────────────────────────────────────────────────────────────────────
+# Memory Optimization
+# ────────────────────────────────────────────────────────────────────────────
+
+bf16: true
+gradient_checkpointing: true
+
+# ────────────────────────────────────────────────────────────────────────────
+# Output
+# ────────────────────────────────────────────────────────────────────────────
+
+output_dir: ./training/output/character-chat-qlora
+logging_steps: 10
+report_to: tensorboard
+save_steps: 500
+save_total_limit: 3
+eval_steps: 500
+do_eval: true
+
+# ────────────────────────────────────────────────────────────────────────────
+# Misc
+# ────────────────────────────────────────────────────────────────────────────
+
+chat_template: llama3
+train_on_inputs: false
+num_workers: 4
+seed: 42
+tf32: true
+

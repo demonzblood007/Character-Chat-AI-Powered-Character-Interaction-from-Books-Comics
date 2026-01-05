@@ -1,0 +1,164 @@
+# ============================================================================
+# vLLM Production Deployment
+# ============================================================================
+#
+# LEARNING NOTES:
+# 
+# This file sets up a production vLLM server. Here's what each part does:
+#
+# 1. vLLM Server: Serves the LLM model
+# 2. Prometheus: Collects metrics from vLLM
+# 3. Grafana: Visualizes metrics
+#
+# REQUIREMENTS:
+# - NVIDIA GPU with CUDA support
+# - nvidia-container-toolkit installed
+# - At least 24GB VRAM for Llama 8B
+#
+# QUICK START:
+#   docker compose -f docker/vllm/docker-compose.yml up -d
+#
+# ============================================================================
+
+services:
+  # ──────────────────────────────────────────────────────────────────────────
+  # vLLM Server
+  # ──────────────────────────────────────────────────────────────────────────
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: character-chat-vllm
+    
+    # GPU access - NVIDIA Container Toolkit required
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all  # Use all available GPUs
+              capabilities: [gpu]
+    
+    # Environment configuration
+    environment:
+      # HuggingFace token for gated models (Llama, Mistral)
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      
+      # vLLM specific settings
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      
+    # vLLM command line arguments
+    # See: https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html
+    command:
+      - "--model"
+      - "${VLLM_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+      
+      # Context window (adjust based on your VRAM)
+      # 8192 = safe for 24GB GPU
+      # 32768 = needs 40GB+ GPU
+      - "--max-model-len"
+      - "${VLLM_MAX_MODEL_LEN:-8192}"
+      
+      # GPU memory utilization (0.9 = 90% of available VRAM)
+      # Lower if you get OOM errors
+      - "--gpu-memory-utilization"
+      - "${VLLM_GPU_MEMORY:-0.90}"
+      
+      # Tensor parallelism (number of GPUs)
+      # 1 = single GPU, 2 = 2 GPUs, etc.
+      - "--tensor-parallel-size"
+      - "${VLLM_TENSOR_PARALLEL:-1}"
+      
+      # Enable chunked prefill for long sequences
+      - "--enable-chunked-prefill"
+      
+      # API settings
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      
+      # Trust remote code (needed for some models)
+      - "--trust-remote-code"
+      
+      # Disable frontend multprocessing for simpler deployment
+      - "--disable-frontend-multiprocessing"
+    
+    ports:
+      - "8000:8000"
+    
+    volumes:
+      # Cache HuggingFace models
+      - huggingface_cache:/root/.cache/huggingface
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s  # Models take time to load
+    
+    restart: unless-stopped
+    
+    networks:
+      - llm-network
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Prometheus (Metrics Collection)
+  # ──────────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: character-chat-prometheus
+    
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+    
+    ports:
+      - "9090:9090"
+    
+    networks:
+      - llm-network
+    
+    depends_on:
+      - vllm
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Grafana (Metrics Visualization)
+  # ──────────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: character-chat-grafana
+    
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin123}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    
+    ports:
+      - "3001:3000"
+    
+    networks:
+      - llm-network
+    
+    depends_on:
+      - prometheus
+
+volumes:
+  huggingface_cache:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  llm-network:
+    driver: bridge
+
